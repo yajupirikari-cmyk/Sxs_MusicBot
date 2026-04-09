@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, PermissionFlagsBits, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, NoSubscriberBehavior, getVoiceConnection } = require('@discordjs/voice');
 const play = require('play-dl');
 const express = require('express');
@@ -20,7 +20,7 @@ const client = new Client({
 
 const queues = new Map();
 
-// コマンド定義
+// --- コマンド定義 ---
 const commands = [
     new SlashCommandBuilder().setName('join').setDescription('ボイスチャンネルにBotを参加させます'),
     new SlashCommandBuilder().setName('leave').setDescription('再生を終了し退出させます'),
@@ -32,22 +32,18 @@ const commands = [
     new SlashCommandBuilder().setName('queue').setDescription('キューを表示します'),
     new SlashCommandBuilder().setName('pause').setDescription('一時停止します'),
     new SlashCommandBuilder().setName('resume').setDescription('再開します'),
-    // ★ ファイルアップロード方式のクッキー登録コマンド
+
+    // ★ モーダル表示用のクッキー登録コマンド (オプションなしに変更)
     new SlashCommandBuilder()
         .setName('setcookie')
-        .setDescription('YouTubeのクッキーJSONファイルを登録して403エラーを回避します')
-        .addAttachmentOption(opt => 
-            opt.setName('file')
-               .setDescription('取得したクッキー情報を保存したJSONまたはテキストファイル')
-               .setRequired(true)
-        )
+        .setDescription('入力フォームを開いてYouTubeのクッキーJSONを登録します')
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator) // 管理者限定
 ];
 
 client.on('ready', async () => {
     console.log(`Logged in as ${client.user.tag}`);
 
-    // 環境変数に直接入力されている場合（文字数制限で切れていない場合に備えて）
+    // 環境変数に値があれば初期セット
     if (process.env.YOUTUBE_COOKIE) {
         try {
             await play.setToken({ youtube: { cookie: JSON.parse(process.env.YOUTUBE_COOKIE) } });
@@ -66,7 +62,33 @@ client.on('ready', async () => {
     }
 });
 
+// --- インタラクション処理 ---
 client.on('interactionCreate', async interaction => {
+    
+    // ==========================================
+    // ★ モーダル(フォーム)送信時の処理
+    // ==========================================
+    if (interaction.isModalSubmit()) {
+        if (interaction.customId === 'cookieModal') {
+            const jsonStr = interaction.fields.getTextInputValue('cookieInput'); // 入力されたテキストを取得
+            try {
+                // 文字列をJSONとして解析して適用
+                const cookieObj = JSON.parse(jsonStr);
+                await play.setToken({
+                    youtube: { cookie: cookieObj }
+                });
+                return interaction.reply({ content: '✅ クッキーを正常に登録しました！これで再生制限が解除されます。', ephemeral: true });
+            } catch (err) {
+                console.error(err);
+                return interaction.reply({ content: '❌ JSONの形式が正しくないか、途切れています。コピーし直してください。', ephemeral: true });
+            }
+        }
+        return;
+    }
+
+    // ==========================================
+    // 通常のチャットコマンド処理
+    // ==========================================
     if (!interaction.isChatInputCommand()) return;
 
     const { commandName, guildId, options, guild } = interaction;
@@ -74,35 +96,30 @@ client.on('interactionCreate', async interaction => {
     let serverQueue = queues.get(guildId);
 
     try {
-        // --- ★ /setcookie コマンド (ファイル読み込み) ---
+        // --- ★ /setcookie (フォームを表示する処理) ---
         if (commandName === 'setcookie') {
-            await interaction.deferReply({ ephemeral: true }); // ファイルDLに時間がかかる可能性があるため待機状態にする
+            // モーダルウィンドウ（ポップアップフォーム）の作成
+            const modal = new ModalBuilder()
+                .setCustomId('cookieModal')
+                .setTitle('YouTube Cookie 登録システム');
 
-            const file = options.getAttachment('file');
-            
-            try {
-                // Discordにアップロードされたファイルの中身をダウンロードして取得
-                const response = await fetch(file.url);
-                const fileText = await response.text();
-                
-                // 文字列をJSONとして解析
-                const cookieObj = JSON.parse(fileText);
-                
-                // play-dlにクッキーを適用
-                await play.setToken({
-                    youtube: {
-                        cookie: cookieObj
-                    }
-                });
-                
-                return interaction.editReply('✅ クッキーファイルを正常に読み込み、登録しました！これで再生制限が解除されます。');
-            } catch (err) {
-                console.error(err);
-                return interaction.editReply('❌ ファイルの読み込みまたは解析に失敗しました。正常なJSON（テキスト）ファイルがアップロードされたか確認してください。');
-            }
+            // 入力エリアの作成
+            const cookieInput = new TextInputBuilder()
+                .setCustomId('cookieInput')
+                .setLabel("JSONの中身をすべて貼り付けてください")
+                .setStyle(TextInputStyle.Paragraph) // 複数行の大きなテキストボックス
+                .setPlaceholder('[{"domain": ".youtube.com", ...}]')
+                .setRequired(true);
+
+            // モーダルに組み込む
+            const actionRow = new ActionRowBuilder().addComponents(cookieInput);
+            modal.addComponents(actionRow);
+
+            // ユーザーにフォームを表示させる
+            return interaction.showModal(modal);
         }
 
-        // --- 以下、既存の音楽コマンド機能 ---
+        // --- 既存の音楽コマンド群 ---
         if (commandName === 'join') {
             if (!voiceChannel) return interaction.reply({ content: '先にVCに参加してください！', ephemeral: true });
             joinVoiceChannel({ channelId: voiceChannel.id, guildId: guildId, adapterCreator: guild.voiceAdapterCreator });
@@ -191,7 +208,7 @@ async function playSong(guild, song) {
         serverQueue.player.play(resource);
     } catch (error) {
         console.error(error);
-        if (serverQueue.textChannel) serverQueue.textChannel.send(`⚠️ 読み込み失敗。YouTube側で制限されている可能性があります。\`/setcookie\`コマンドで最新のクッキーファイルを登録してください。`);
+        if (serverQueue.textChannel) serverQueue.textChannel.send(`⚠️ 読み込み失敗。YouTube側で制限されている可能性があります。\`/setcookie\` コマンドでJSONを更新してください。`);
         serverQueue.songs.shift();
         playSong(guild, serverQueue.songs[0]);
     }

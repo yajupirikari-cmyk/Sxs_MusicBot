@@ -4,8 +4,13 @@ const play = require('play-dl');
 const express = require('express');
 
 // ==========================================
-// ★ これが無いと無音になるFFmpeg強制指定
+// ★ 最終兵器：Renderの無音化を根絶する「IPv4強制通信」パッチ
+// 音声データが「ブラックホール（IPv6）」に迷い込んで消滅するのを防ぎます
 // ==========================================
+const dns = require('dns');
+dns.setDefaultResultOrder('ipv4first');
+
+// FFmpeg強制指定
 const ffmpegPath = require('ffmpeg-static');
 process.env.FFMPEG_PATH = ffmpegPath;
 
@@ -20,9 +25,7 @@ const client = new Client({
 
 const queues = new Map();
 
-// ==========================================
-// ★ 最重要：Botの自爆ループを防ぐ完全防御システム
-// ==========================================
+// タイムアウトしても自爆しない完全防御システム
 client.on('error', error => console.error('Discord Client Error:', error));
 process.on('unhandledRejection', error => console.error('Unhandled promise rejection:', error));
 process.on('uncaughtException', error => console.error('Uncaught Exception:', error));
@@ -77,7 +80,6 @@ client.on('interactionCreate', async interaction => {
         if (commandName === 'play') {
             if (!voiceChannel) return interaction.reply({ content: '先にVCに入ってください！', ephemeral: true }).catch(() => {});
             
-            // 3秒ルールのタイムアウトを回避するため、即座に「考え中...」状態にする
             await interaction.deferReply().catch(() => {});
 
             const query = options.getString('query');

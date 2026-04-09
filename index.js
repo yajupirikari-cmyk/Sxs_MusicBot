@@ -4,6 +4,12 @@ const play = require('play-dl');
 const express = require('express');
 
 // ==========================================
+// ★ 無音バグ修正パッチ (FFmpegの位置を強制指定)
+// ==========================================
+const ffmpegPath = require('ffmpeg-static');
+process.env.FFMPEG_PATH = ffmpegPath;
+
+// ==========================================
 // 1. ダミーWebサーバー (稼働維持用)
 // ==========================================
 const app = express();
@@ -32,24 +38,22 @@ const commands = [
     new SlashCommandBuilder().setName('queue').setDescription('キューを表示します'),
     new SlashCommandBuilder().setName('pause').setDescription('一時停止します'),
     new SlashCommandBuilder().setName('resume').setDescription('再開します'),
-
-    // ★ モーダル表示用のクッキー登録コマンド (オプションなしに変更)
     new SlashCommandBuilder()
         .setName('setcookie')
         .setDescription('入力フォームを開いてYouTubeのクッキーJSONを登録します')
-        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator) // 管理者限定
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
 ];
 
 client.on('ready', async () => {
     console.log(`Logged in as ${client.user.tag}`);
 
-    // 環境変数に値があれば初期セット
+    // Renderの環境変数からクッキーを読み込む（設定済みならここが動きます）
     if (process.env.YOUTUBE_COOKIE) {
         try {
             await play.setToken({ youtube: { cookie: JSON.parse(process.env.YOUTUBE_COOKIE) } });
-            console.log('環境変数から初期クッキーをロードしました');
+            console.log('環境変数から初期クッキーを正常にロードしました');
         } catch (e) {
-            console.log('環境変数のクッキーロードはスキップされました');
+            console.log('クッキーのロードに失敗しました');
         }
     }
 
@@ -65,30 +69,22 @@ client.on('ready', async () => {
 // --- インタラクション処理 ---
 client.on('interactionCreate', async interaction => {
     
-    // ==========================================
-    // ★ モーダル(フォーム)送信時の処理
-    // ==========================================
+    // モーダル(フォーム)送信時の処理
     if (interaction.isModalSubmit()) {
         if (interaction.customId === 'cookieModal') {
-            const jsonStr = interaction.fields.getTextInputValue('cookieInput'); // 入力されたテキストを取得
+            const jsonStr = interaction.fields.getTextInputValue('cookieInput');
             try {
-                // 文字列をJSONとして解析して適用
                 const cookieObj = JSON.parse(jsonStr);
-                await play.setToken({
-                    youtube: { cookie: cookieObj }
-                });
-                return interaction.reply({ content: '✅ クッキーを正常に登録しました！これで再生制限が解除されます。', ephemeral: true });
+                await play.setToken({ youtube: { cookie: cookieObj } });
+                return interaction.reply({ content: '✅ クッキーを正常に登録しました！', ephemeral: true });
             } catch (err) {
                 console.error(err);
-                return interaction.reply({ content: '❌ JSONの形式が正しくないか、途切れています。コピーし直してください。', ephemeral: true });
+                return interaction.reply({ content: '❌ JSONの形式が正しくありません。', ephemeral: true });
             }
         }
         return;
     }
 
-    // ==========================================
-    // 通常のチャットコマンド処理
-    // ==========================================
     if (!interaction.isChatInputCommand()) return;
 
     const { commandName, guildId, options, guild } = interaction;
@@ -96,33 +92,22 @@ client.on('interactionCreate', async interaction => {
     let serverQueue = queues.get(guildId);
 
     try {
-        // --- ★ /setcookie (フォームを表示する処理) ---
         if (commandName === 'setcookie') {
-            // モーダルウィンドウ（ポップアップフォーム）の作成
-            const modal = new ModalBuilder()
-                .setCustomId('cookieModal')
-                .setTitle('YouTube Cookie 登録システム');
-
-            // 入力エリアの作成
-            const cookieInput = new TextInputBuilder()
-                .setCustomId('cookieInput')
-                .setLabel("JSONの中身をすべて貼り付けてください")
-                .setStyle(TextInputStyle.Paragraph) // 複数行の大きなテキストボックス
-                .setPlaceholder('[{"domain": ".youtube.com", ...}]')
-                .setRequired(true);
-
-            // モーダルに組み込む
+            const modal = new ModalBuilder().setCustomId('cookieModal').setTitle('YouTube Cookie 登録');
+            const cookieInput = new TextInputBuilder().setCustomId('cookieInput').setLabel("JSONの中身").setStyle(TextInputStyle.Paragraph).setRequired(true);
             const actionRow = new ActionRowBuilder().addComponents(cookieInput);
             modal.addComponents(actionRow);
-
-            // ユーザーにフォームを表示させる
             return interaction.showModal(modal);
         }
 
-        // --- 既存の音楽コマンド群 ---
         if (commandName === 'join') {
             if (!voiceChannel) return interaction.reply({ content: '先にVCに参加してください！', ephemeral: true });
-            joinVoiceChannel({ channelId: voiceChannel.id, guildId: guildId, adapterCreator: guild.voiceAdapterCreator });
+            joinVoiceChannel({ 
+                channelId: voiceChannel.id, 
+                guildId: guildId, 
+                adapterCreator: guild.voiceAdapterCreator,
+                selfDeaf: true // ★無音通信バグ対策
+            });
             return interaction.reply('🔊 ボイスチャンネルに参加しました！');
         }
 
@@ -148,12 +133,25 @@ client.on('interactionCreate', async interaction => {
                 const queueConstruct = {
                     textChannel: interaction.channel,
                     voiceChannel,
-                    connection: joinVoiceChannel({ channelId: voiceChannel.id, guildId, adapterCreator: guild.voiceAdapterCreator }),
+                    connection: joinVoiceChannel({ 
+                        channelId: voiceChannel.id, 
+                        guildId, 
+                        adapterCreator: guild.voiceAdapterCreator,
+                        selfDeaf: true // ★無音通信バグ対策
+                    }),
                     songs: [song],
                     player: createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } }),
                 };
                 queues.set(guildId, queueConstruct);
                 queueConstruct.connection.subscribe(queueConstruct.player);
+
+                // ★万が一、裏でプレイヤーが落ちた場合にチャットに警告を出すよう修正
+                queueConstruct.player.on('error', error => {
+                    console.error('AudioPlayerError:', error);
+                    queueConstruct.textChannel.send(`⚠️ 内部の音声プレイヤーでエラーが起きました: ${error.message}`);
+                    queueConstruct.songs.shift();
+                    playSong(guild, queueConstruct.songs[0]);
+                });
 
                 queueConstruct.player.on(AudioPlayerStatus.Idle, () => {
                     queueConstruct.songs.shift();
@@ -208,7 +206,7 @@ async function playSong(guild, song) {
         serverQueue.player.play(resource);
     } catch (error) {
         console.error(error);
-        if (serverQueue.textChannel) serverQueue.textChannel.send(`⚠️ 読み込み失敗。YouTube側で制限されている可能性があります。\`/setcookie\` コマンドでJSONを更新してください。`);
+        if (serverQueue.textChannel) serverQueue.textChannel.send(`⚠️ 読み込み失敗: サーバー通信エラー。次の曲へスキップします...`);
         serverQueue.songs.shift();
         playSong(guild, serverQueue.songs[0]);
     }

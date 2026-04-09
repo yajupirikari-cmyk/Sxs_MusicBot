@@ -1,265 +1,197 @@
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, NoSubscriberBehavior, getVoiceConnection } = require('@discordjs/voice');
 const play = require('play-dl');
 const express = require('express');
 
 // ==========================================
-// 1. ダミーWebサーバー (Render運用 & UptimeRobotスリープ防止用)
+// 1. ダミーWebサーバー (Render & UptimeRobot スリープ防止)
 // ==========================================
 const app = express();
 const port = process.env.PORT || 3000;
-
-app.get('/', (req, res) => {
-    res.status(200).send('Discord Slash Commands Music Bot Running!');
-});
-
-app.listen(port, () => {
-    console.log(`Web server is listening on port ${port}`);
-});
+app.get('/', (req, res) => res.status(200).send('Discord Music Bot 24/7 with Cookie Manager is Online!'));
+app.listen(port, () => console.log(`Web server listening on port ${port}`));
 
 // ==========================================
-// 2. Discord 音楽Bot ロジック (スラッシュコマンド対応)
+// 2. Discord 音楽Bot ロジック
 // ==========================================
 const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildVoiceStates, // ボイス接続に必要
-        // (スラッシュコマンドを使用するため MessageContent のインテントは不要になりました)
-    ]
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates]
 });
 
 const queues = new Map();
 
-// ----------------------------------------
-// スラッシュコマンドの定義
-// ----------------------------------------
+// コマンド定義
 const commands = [
     new SlashCommandBuilder().setName('join').setDescription('ボイスチャンネルにBotを参加させます'),
-    new SlashCommandBuilder().setName('leave').setDescription('再生を停止し、ボイスチャンネルから退出させます'),
+    new SlashCommandBuilder().setName('leave').setDescription('再生を終了し退出させます'),
     new SlashCommandBuilder()
         .setName('play')
-        .setDescription('指定した音楽を再生、または再生順（キュー）に追加します')
-        .addStringOption(option => 
-            option.setName('query')
-                .setDescription('検索したい曲名、またはYouTubeのURL')
-                .setRequired(true)
-        ),
-    new SlashCommandBuilder().setName('skip').setDescription('現在流れている曲をスキップします'),
-    new SlashCommandBuilder().setName('queue').setDescription('現在の再生予定リスト（キュー）を確認します'),
-    new SlashCommandBuilder().setName('pause').setDescription('流れている音楽を一時停止します'),
-    new SlashCommandBuilder().setName('resume').setDescription('一時停止した音楽の再生を再開します'),
+        .setDescription('音楽を再生またはキューに追加します')
+        .addStringOption(opt => opt.setName('query').setDescription('曲名またはURL').setRequired(true)),
+    new SlashCommandBuilder().setName('skip').setDescription('曲をスキップします'),
+    new SlashCommandBuilder().setName('queue').setDescription('キューを表示します'),
+    new SlashCommandBuilder().setName('pause').setDescription('一時停止します'),
+    new SlashCommandBuilder().setName('resume').setDescription('再開します'),
+    // クッキー登録用コマンド (セキュリティのため管理者権限のみ許可することも可能)
+    new SlashCommandBuilder()
+        .setName('setcookie')
+        .setDescription('YouTubeのクッキーJSONを登録して403エラーを回避します')
+        .addStringOption(opt => opt.setName('json').setDescription('取得したJSON文字列をここに貼り付けてください').setRequired(true))
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator) // 管理者のみ実行可能
 ];
 
-// Botの起動時にスラッシュコマンドをDiscordシステムに登録する
+// 起動時の処理
 client.on('ready', async () => {
-    console.log(`Bot logged in successfully as ${client.user.tag}`);
+    console.log(`Logged in as ${client.user.tag}`);
+
+    // 環境変数にクッキーがあれば初期セット
+    if (process.env.YOUTUBE_COOKIE) {
+        try {
+            await play.setToken({ youtube: { cookie: JSON.parse(process.env.YOUTUBE_COOKIE) } });
+            console.log('環境変数から初期クッキーをロードしました');
+        } catch (e) {
+            console.error('環境変数のクッキーロードに失敗しました');
+        }
+    }
 
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
     try {
-        console.log('スラッシュコマンドの登録を開始します...');
-        await rest.put(
-            Routes.applicationCommands(client.user.id),
-            { body: commands }
-        );
-        console.log('スラッシュコマンドの登録が完了しました！Discord内で使用可能です。');
-    } catch (error) {
-        console.error('スラッシュコマンドの登録中にエラーが発生しました:', error);
+        await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+        console.log('Slash commands registered.');
+    } catch (e) {
+        console.error(e);
     }
 });
 
-// ----------------------------------------
-// コマンドが実行された時の処理
-// ----------------------------------------
+// インタラクション処理
 client.on('interactionCreate', async interaction => {
-    if (!interaction.isChatInputCommand()) return; // スラッシュコマンド以外は無視
+    if (!interaction.isChatInputCommand()) return;
 
-    const { commandName } = interaction;
+    const { commandName, guildId, options, guild } = interaction;
     const voiceChannel = interaction.member.voice.channel;
+    let serverQueue = queues.get(guildId);
 
     try {
-        // ===== /join (ジョイン) =====
-        if (commandName === 'join') {
-            if (!voiceChannel) {
-                return interaction.reply({ content: '先にいずれかのボイスチャンネルに参加してください！', ephemeral: true });
+        // --- /setcookie コマンド ---
+        if (commandName === 'setcookie') {
+            const jsonStr = options.getString('json');
+            try {
+                const cookieObj = JSON.parse(jsonStr);
+                await play.setToken({
+                    youtube: {
+                        cookie: cookieObj
+                    }
+                });
+                return interaction.reply({ content: '✅ YouTubeクッキーを正常に登録しました！これで再生制限が解除されます。', ephemeral: true });
+            } catch (err) {
+                console.error(err);
+                return interaction.reply({ content: '❌ JSONの形式が正しくありません。取得した中身をそのまま貼り付けてください。', ephemeral: true });
             }
-            
+        }
+
+        // --- /join ---
+        if (commandName === 'join') {
+            if (!voiceChannel) return interaction.reply({ content: '先にVCに参加してください！', ephemeral: true });
             joinVoiceChannel({
                 channelId: voiceChannel.id,
-                guildId: interaction.guild.id,
-                adapterCreator: interaction.guild.voiceAdapterCreator,
+                guildId: guildId,
+                adapterCreator: guild.voiceAdapterCreator,
             });
-            await interaction.reply('🔊 ボイスチャンネルに参加しました！');
+            return interaction.reply('🔊 ボイスチャンネルに参加しました！');
         }
 
-        // ===== /leave (退出) =====
+        // --- /leave ---
         if (commandName === 'leave') {
-            const connection = getVoiceConnection(interaction.guild.id);
-            if (!connection) {
-                return interaction.reply({ content: 'Botはどのボイスチャンネルにも参加していません。', ephemeral: true });
-            }
-
-            const serverQueue = queues.get(interaction.guild.id);
-            if (serverQueue) {
-                serverQueue.songs = []; // キューをリセット
-                serverQueue.player.stop();
-                queues.delete(interaction.guild.id);
-            }
-
-            connection.destroy(); // 切断
-            await interaction.reply('👋 再生を終了し、ボイスチャンネルから退出しました！');
+            const connection = getVoiceConnection(guildId);
+            if (!connection) return interaction.reply('Botは参加していません。');
+            if (serverQueue) { serverQueue.songs = []; serverQueue.player.stop(); queues.delete(guildId); }
+            connection.destroy();
+            return interaction.reply('👋 退出しました。');
         }
 
-        // ===== /play (再生) =====
+        // --- /play ---
         if (commandName === 'play') {
-            if (!voiceChannel) return interaction.reply({ content: '先にボイスチャンネルに参加してください！', ephemeral: true });
+            if (!voiceChannel) return interaction.reply({ content: '先にVCに入ってください！', ephemeral: true });
+            await interaction.deferReply();
 
-            // 検索に数秒かかる場合があるため、Discordからタイムアウトされないよう「考え中...」の待機状態にする
-            await interaction.deferReply(); 
-
-            const query = interaction.options.getString('query');
-            let serverQueue = queues.get(interaction.guild.id);
-
+            const query = options.getString('query');
             const ytInfo = await play.search(query, { limit: 1 });
-            if (!ytInfo || ytInfo.length === 0) {
-                return interaction.editReply('指定された検索条件で動画が見つかりませんでした。');
-            }
+            if (!ytInfo.length) return interaction.editReply('動画が見つかりませんでした。');
 
-            const songData = ytInfo[0];
-            const song = {
-                title: songData.title,
-                url: songData.url,
-                duration: songData.durationRaw // 例: "4:30"
-            };
+            const song = { title: ytInfo[0].title, url: ytInfo[0].url, duration: ytInfo[0].durationRaw };
 
-            // はじめて再生する場合
             if (!serverQueue) {
                 const queueConstruct = {
                     textChannel: interaction.channel,
-                    voiceChannel: voiceChannel,
-                    connection: null,
-                    songs: [],
-                    player: createAudioPlayer({
-                        behaviors: { noSubscriber: NoSubscriberBehavior.Pause }
-                    }),
-                    playing: true
+                    voiceChannel,
+                    connection: joinVoiceChannel({ channelId: voiceChannel.id, guildId, adapterCreator: guild.voiceAdapterCreator }),
+                    songs: [song],
+                    player: createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } }),
                 };
+                queues.set(guildId, queueConstruct);
+                queueConstruct.connection.subscribe(queueConstruct.player);
 
-                queues.set(interaction.guild.id, queueConstruct);
-                queueConstruct.songs.push(song);
-
-                const connection = joinVoiceChannel({
-                    channelId: voiceChannel.id,
-                    guildId: interaction.guild.id,
-                    adapterCreator: interaction.guild.voiceAdapterCreator,
-                });
-                
-                queueConstruct.connection = connection;
-                connection.subscribe(queueConstruct.player);
-
-                // 曲が終わったら次へ移行
                 queueConstruct.player.on(AudioPlayerStatus.Idle, () => {
-                    queueConstruct.songs.shift(); // 終わった曲を配列から削除
-                    playSong(interaction.guild, queueConstruct.songs[0]); // 次の曲
-                });
-
-                queueConstruct.player.on('error', error => {
-                    console.error('AudioPlayerError:', error);
                     queueConstruct.songs.shift();
-                    playSong(interaction.guild, queueConstruct.songs[0]);
+                    playSong(guild, queueConstruct.songs[0]);
                 });
 
-                playSong(interaction.guild, queueConstruct.songs[0]);
-                await interaction.editReply(`▶️ **${song.title}** の再生を開始します！`);
+                playSong(guild, queueConstruct.songs[0]);
+                return interaction.editReply(`▶️ **${song.title}** を再生します！`);
             } else {
-                // 既に再生中の場合はキューの後ろに追加
                 serverQueue.songs.push(song);
-                await interaction.editReply(`📝 **${song.title}** を再生リストに追加しました！`);
+                return interaction.editReply(`📝 **${song.title}** をキューに追加しました。`);
             }
         }
 
-        // ===== /skip (スキップ) =====
+        // --- /skip ---
         if (commandName === 'skip') {
-            const serverQueue = queues.get(interaction.guild.id);
-            if (!voiceChannel) return interaction.reply({ content: 'ボイスチャンネルに参加してください！', ephemeral: true });
-            if (!serverQueue || serverQueue.songs.length === 0) {
-                return interaction.reply({ content: '現在スキップする曲が存在しません。', ephemeral: true });
-            }
-
-            serverQueue.player.stop(); // 停止すると自動でIdleイベントが呼ばれ、次の曲へ飛ぶ
-            await interaction.reply('⏭️ 現在の曲をスキップしました！');
+            if (!serverQueue) return interaction.reply('スキップする曲がありません。');
+            serverQueue.player.stop();
+            return interaction.reply('⏭️ スキップしました。');
         }
 
-        // ===== /queue (キュー一覧) =====
+        // --- /queue ---
         if (commandName === 'queue') {
-            const serverQueue = queues.get(interaction.guild.id);
-            if (!serverQueue || serverQueue.songs.length === 0) {
-                return interaction.reply({ content: '現在再生リストには何もありません。', ephemeral: true });
-            }
-
-            // キュー内の最大10曲だけを表示する（文字数制限対策）
-            let queueString = serverQueue.songs.slice(0, 10).map((song, index) => {
-                return `${index === 0 ? '**[再生中]**' : `**${index}.**`} ${song.title} (${song.duration})`;
-            }).join('\n');
-
-            if (serverQueue.songs.length > 10) {
-                queueString += `\n\n...他 ${serverQueue.songs.length - 10} 曲`;
-            }
-
-            await interaction.reply(`**🎵 現在の再生リスト:**\n${queueString}`);
+            if (!serverQueue) return interaction.reply('キューは空です。');
+            const list = serverQueue.songs.slice(0, 5).map((s, i) => `${i === 0 ? '▶️' : `${i}.`} ${s.title}`).join('\n');
+            return interaction.reply(`**現在のキュー:**\n${list}\n全${serverQueue.songs.length}曲`);
         }
 
-        // ===== /pause (一時停止) =====
+        // --- /pause ---
         if (commandName === 'pause') {
-            const serverQueue = queues.get(interaction.guild.id);
-            if (!serverQueue) return interaction.reply({ content: '再生中の曲がありません。', ephemeral: true });
-
+            if (!serverQueue) return interaction.reply('再生中ではありません。');
             serverQueue.player.pause();
-            await interaction.reply('⏸️ 再生を一時停止しました。');
+            return interaction.reply('⏸️ 一時停止しました。');
         }
 
-        // ===== /resume (再開) =====
+        // --- /resume ---
         if (commandName === 'resume') {
-            const serverQueue = queues.get(interaction.guild.id);
-            if (!serverQueue) return interaction.reply({ content: '再生中の曲がありません。', ephemeral: true });
-
+            if (!serverQueue) return interaction.reply('曲がありません。');
             serverQueue.player.unpause();
-            await interaction.reply('▶️ 再生を再開しました。');
+            return interaction.reply('▶️ 再開します。');
         }
 
-    } catch (cmdError) {
-        console.error('Command Execution Error:', cmdError);
-        // 万が一エラーが起きてもBotが落ちないようにする
-        if (interaction.deferred || interaction.replied) {
-            await interaction.editReply('❌ コマンドの実行中に内部エラーが発生しました。').catch(console.error);
-        } else {
-            await interaction.reply({ content: '❌ コマンドの実行中に内部エラーが発生しました。', ephemeral: true }).catch(console.error);
-        }
+    } catch (e) {
+        console.error(e);
+        if (interaction.deferred) interaction.editReply('❌ エラーが発生しました。クッキーを再設定してみてください。');
     }
 });
 
-/**
- * 実際に音楽ストリームを取得し、Discord内で再生する関数
- */
 async function playSong(guild, song) {
     const serverQueue = queues.get(guild.id);
-    if (!serverQueue) return;
-
-    // キューが空になった場合（退出させずに無音で待機させます）
-    if (!song) return; 
+    if (!song) return; // 終わっても勝手に退出はさせない（/leaveで退出）
 
     try {
         const stream = await play.stream(song.url);
         const resource = createAudioResource(stream.stream, { inputType: stream.type });
         serverQueue.player.play(resource);
     } catch (error) {
-        console.error('Failed to play the song:', error);
-        if (serverQueue.textChannel) {
-            serverQueue.textChannel.send(`⚠️ 曲のストリーム読み込みに失敗しました。次の曲へスキップします: **${song.title}**`);
-        }
-        serverQueue.songs.shift(); // 失敗した曲を消して次を再生
+        console.error(error);
+        if (serverQueue.textChannel) serverQueue.textChannel.send(`⚠️ 読み込み失敗。クッキーが無効な可能性があります。/setcookie を試してください。`);
+        serverQueue.songs.shift();
         playSong(guild, serverQueue.songs[0]);
     }
 }
 
-// Botログイン
 client.login(process.env.DISCORD_TOKEN);

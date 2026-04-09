@@ -4,27 +4,28 @@ const play = require('play-dl');
 const express = require('express');
 
 // ==========================================
-// ★ 無音バグ修正パッチ (FFmpeg強制指定)
+// ★ これが無いと無音になるFFmpeg強制指定
 // ==========================================
 const ffmpegPath = require('ffmpeg-static');
 process.env.FFMPEG_PATH = ffmpegPath;
 
-// ==========================================
-// 1. ダミーWebサーバー (稼働維持用)
-// ==========================================
 const app = express();
 const port = process.env.PORT || 3000;
-app.get('/', (req, res) => res.status(200).send('Discord Music Bot (SoundCloud Bypass) is Online!'));
+app.get('/', (req, res) => res.status(200).send('Discord Music Bot is Online & Uncrashable!'));
 app.listen(port, () => console.log(`Web server listening on port ${port}`));
 
-// ==========================================
-// 2. Discord 音楽Bot ロジック
-// ==========================================
 const client = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates]
 });
 
 const queues = new Map();
+
+// ==========================================
+// ★ 最重要：Botの自爆ループを防ぐ完全防御システム
+// ==========================================
+client.on('error', error => console.error('Discord Client Error:', error));
+process.on('unhandledRejection', error => console.error('Unhandled promise rejection:', error));
+process.on('uncaughtException', error => console.error('Uncaught Exception:', error));
 
 const commands = [
     new SlashCommandBuilder().setName('join').setDescription('ボイスチャンネルにBotを参加させます'),
@@ -36,51 +37,22 @@ const commands = [
     new SlashCommandBuilder().setName('skip').setDescription('曲をスキップします'),
     new SlashCommandBuilder().setName('queue').setDescription('キューを表示します'),
     new SlashCommandBuilder().setName('pause').setDescription('一時停止します'),
-    new SlashCommandBuilder().setName('resume').setDescription('再開します'),
-    new SlashCommandBuilder()
-        .setName('setcookie')
-        .setDescription('入力フォームを開いてYouTubeのクッキーJSONを登録します')
-        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    new SlashCommandBuilder().setName('resume').setDescription('再開します')
 ];
 
 client.on('ready', async () => {
     console.log(`Logged in as ${client.user.tag}`);
-
     if (process.env.YOUTUBE_COOKIE) {
         try {
             await play.setToken({ youtube: { cookie: JSON.parse(process.env.YOUTUBE_COOKIE) } });
-            console.log('環境変数からのクッキーロード成功');
-        } catch (e) {
-            console.log('クッキーのロードスキップ');
-        }
+            console.log('クッキー読込完了');
+        } catch (e) {}
     }
-
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-    try {
-        await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
-        console.log('Slash commands registered.');
-    } catch (e) {
-        console.error(e);
-    }
+    try { await rest.put(Routes.applicationCommands(client.user.id), { body: commands }); } catch (e) {}
 });
 
 client.on('interactionCreate', async interaction => {
-    
-    if (interaction.isModalSubmit()) {
-        if (interaction.customId === 'cookieModal') {
-            const jsonStr = interaction.fields.getTextInputValue('cookieInput');
-            try {
-                const cookieObj = JSON.parse(jsonStr);
-                await play.setToken({ youtube: { cookie: cookieObj } });
-                return interaction.reply({ content: '✅ クッキーを正常に登録しました！', ephemeral: true });
-            } catch (err) {
-                console.error(err);
-                return interaction.reply({ content: '❌ JSONの形式が正しくありません。', ephemeral: true });
-            }
-        }
-        return;
-    }
-
     if (!interaction.isChatInputCommand()) return;
 
     const { commandName, guildId, options, guild } = interaction;
@@ -88,61 +60,42 @@ client.on('interactionCreate', async interaction => {
     let serverQueue = queues.get(guildId);
 
     try {
-        if (commandName === 'setcookie') {
-            const modal = new ModalBuilder().setCustomId('cookieModal').setTitle('YouTube Cookie 登録');
-            const cookieInput = new TextInputBuilder().setCustomId('cookieInput').setLabel("JSONの中身").setStyle(TextInputStyle.Paragraph).setRequired(true);
-            const actionRow = new ActionRowBuilder().addComponents(cookieInput);
-            modal.addComponents(actionRow);
-            return interaction.showModal(modal);
-        }
-
         if (commandName === 'join') {
-            if (!voiceChannel) return interaction.reply({ content: '先にVCに参加してください！', ephemeral: true });
-            joinVoiceChannel({ channelId: voiceChannel.id, guildId: guildId, adapterCreator: guild.voiceAdapterCreator, selfDeaf: true });
-            return interaction.reply('🔊 ボイスチャンネルに参加しました！');
+            if (!voiceChannel) return interaction.reply({ content: '先にVCに参加してください！', ephemeral: true }).catch(() => {});
+            joinVoiceChannel({ channelId: voiceChannel.id, guildId, adapterCreator: guild.voiceAdapterCreator, selfDeaf: true });
+            return interaction.reply('🔊 ボイスチャンネルに参加しました！').catch(() => {});
         }
 
         if (commandName === 'leave') {
             const connection = getVoiceConnection(guildId);
-            if (!connection) return interaction.reply('Botは参加していません。');
+            if (!connection) return interaction.reply('Botは参加していません。').catch(() => {});
             if (serverQueue) { serverQueue.songs = []; serverQueue.player.stop(); queues.delete(guildId); }
             connection.destroy();
-            return interaction.reply('👋 退出しました。');
+            return interaction.reply('👋 退出しました。').catch(() => {});
         }
 
         if (commandName === 'play') {
-            if (!voiceChannel) return interaction.reply({ content: '先にVCに入ってください！', ephemeral: true });
-            await interaction.deferReply();
+            if (!voiceChannel) return interaction.reply({ content: '先にVCに入ってください！', ephemeral: true }).catch(() => {});
+            
+            // 3秒ルールのタイムアウトを回避するため、即座に「考え中...」状態にする
+            await interaction.deferReply().catch(() => {});
 
             const query = options.getString('query');
-            
-            // 1. まず普通に検索（YouTubeなどから曲名を取得）
             const ytInfo = await play.search(query, { limit: 1 });
-            if (!ytInfo.length) return interaction.editReply('動画が見つかりませんでした。');
+            if (!ytInfo.length) return interaction.editReply('動画が見つかりませんでした。').catch(() => {});
 
             const originalTitle = ytInfo[0].title;
             let finalUrl = ytInfo[0].url;
 
-            // ==========================================
-            // ★ YouTubeブロック無効化ロジック (SoundCloudう回)
-            // ==========================================
             try {
                 if (finalUrl.includes('youtube.com') || finalUrl.includes('youtu.be')) {
-                    // SoundCloudのシステム通行証を取得
                     const scClientId = await play.getFreeClientID();
                     await play.setToken({ soundcloud: { client_id: scClientId } });
-                    
-                    // 取得したYouTubeの正規タイトルを使って、SoundCloud上から全く同じ音源を探す
                     const scInfo = await play.search(originalTitle, { source: { soundcloud: 'tracks' }, limit: 1 });
-                    if (scInfo && scInfo.length > 0) {
-                        finalUrl = scInfo[0].url; // 再生用のURLだけを制限のないSoundCloudにすり替える！
-                    }
+                    if (scInfo && scInfo.length > 0) finalUrl = scInfo[0].url;
                 }
-            } catch (err) {
-                console.error('SoundCloudへのう回に失敗（元のURLで試行します）:', err);
-            }
+            } catch (err) {}
 
-            // ユーザーに表示する画面上ではYouTubeのタイトルのままになる
             const song = { title: originalTitle, url: finalUrl, duration: ytInfo[0].durationRaw };
 
             if (!serverQueue) {
@@ -157,52 +110,51 @@ client.on('interactionCreate', async interaction => {
                 queueConstruct.connection.subscribe(queueConstruct.player);
 
                 queueConstruct.player.on('error', error => {
-                    console.error('AudioPlayerError:', error);
-                    queueConstruct.textChannel.send(`⚠️ プレイヤー内部でエラー: ${error.message}`);
+                    queueConstruct.textChannel.send(`⚠️ エラー発生: ${error.message}`).catch(() => {});
                     queueConstruct.songs.shift();
-                    playSong(guild, queueConstruct.songs[0]);
+                    if (queueConstruct.songs.length > 0) playSong(guild, queueConstruct.songs[0]);
                 });
 
                 queueConstruct.player.on(AudioPlayerStatus.Idle, () => {
                     queueConstruct.songs.shift();
-                    playSong(guild, queueConstruct.songs[0]);
+                    if (queueConstruct.songs.length > 0) playSong(guild, queueConstruct.songs[0]);
                 });
 
                 playSong(guild, queueConstruct.songs[0]);
-                return interaction.editReply(`▶️ **${song.title}** を再生します！`);
+                return interaction.editReply(`▶️ **${song.title}** を再生します！`).catch(() => {});
             } else {
                 serverQueue.songs.push(song);
-                return interaction.editReply(`📝 **${song.title}** をキューに追加しました。`);
+                return interaction.editReply(`📝 **${song.title}** をキューに追加しました。`).catch(() => {});
             }
         }
 
         if (commandName === 'skip') {
-            if (!serverQueue) return interaction.reply('スキップする曲がありません。');
+            if (!serverQueue) return interaction.reply('スキップする曲がありません。').catch(() => {});
             serverQueue.player.stop();
-            return interaction.reply('⏭️ スキップしました。');
+            return interaction.reply('⏭️ スキップしました。').catch(() => {});
         }
 
         if (commandName === 'queue') {
-            if (!serverQueue || serverQueue.songs.length === 0) return interaction.reply('キューは空です。');
+            if (!serverQueue || serverQueue.songs.length === 0) return interaction.reply('キューは空です。').catch(() => {});
             const list = serverQueue.songs.slice(0, 5).map((s, i) => `${i === 0 ? '▶️' : `${i}.`} ${s.title}`).join('\n');
-            return interaction.reply(`**現在のキュー:**\n${list}\n全${serverQueue.songs.length}曲`);
+            return interaction.reply(`**現在のキュー:**\n${list}\n全${serverQueue.songs.length}曲`).catch(() => {});
         }
 
         if (commandName === 'pause') {
-            if (!serverQueue) return interaction.reply('再生中ではありません。');
+            if (!serverQueue) return interaction.reply('再生中ではありません。').catch(() => {});
             serverQueue.player.pause();
-            return interaction.reply('⏸️ 一時停止しました。');
+            return interaction.reply('⏸️ 一時停止しました。').catch(() => {});
         }
 
         if (commandName === 'resume') {
-            if (!serverQueue) return interaction.reply('曲がありません。');
+            if (!serverQueue) return interaction.reply('曲がありません。').catch(() => {});
             serverQueue.player.unpause();
-            return interaction.reply('▶️ 再開します。');
+            return interaction.reply('▶️ 再開します。').catch(() => {});
         }
 
     } catch (e) {
         console.error(e);
-        if (interaction.deferred) interaction.editReply('❌ 内部エラーが発生しました。').catch(()=>false);
+        if (interaction.deferred) interaction.editReply('❌ エラーが発生しました。').catch(()=>false);
     }
 });
 
@@ -211,14 +163,15 @@ async function playSong(guild, song) {
     if (!song) return;
 
     try {
-        const stream = await play.stream(song.url);
+        const stream = await play.stream(song.url, { discordPlayerCompatibility: true });
         const resource = createAudioResource(stream.stream, { inputType: stream.type });
         serverQueue.player.play(resource);
+        
     } catch (error) {
         console.error(error);
-        if (serverQueue.textChannel) serverQueue.textChannel.send(`⚠️ 読み込み失敗: セキュリティによりダウンロードが遮断されました。次の曲へスキップします...`);
+        if (serverQueue.textChannel) serverQueue.textChannel.send(`⚠️ 再生処理に失敗しました。次の曲へスキップします...`).catch(()=>{});
         serverQueue.songs.shift();
-        playSong(guild, serverQueue.songs[0]);
+        if (serverQueue.songs.length > 0) playSong(guild, serverQueue.songs[0]);
     }
 }
 

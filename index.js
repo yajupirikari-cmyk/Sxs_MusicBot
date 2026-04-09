@@ -4,7 +4,7 @@ const play = require('play-dl');
 const express = require('express');
 
 // ==========================================
-// ★ 無音バグ修正パッチ (FFmpegの位置を強制指定)
+// ★ 無音バグ修正パッチ (FFmpeg強制指定)
 // ==========================================
 const ffmpegPath = require('ffmpeg-static');
 process.env.FFMPEG_PATH = ffmpegPath;
@@ -14,7 +14,7 @@ process.env.FFMPEG_PATH = ffmpegPath;
 // ==========================================
 const app = express();
 const port = process.env.PORT || 3000;
-app.get('/', (req, res) => res.status(200).send('Discord Music Bot 24/7 is Online!'));
+app.get('/', (req, res) => res.status(200).send('Discord Music Bot (SoundCloud Bypass) is Online!'));
 app.listen(port, () => console.log(`Web server listening on port ${port}`));
 
 // ==========================================
@@ -26,7 +26,6 @@ const client = new Client({
 
 const queues = new Map();
 
-// --- コマンド定義 ---
 const commands = [
     new SlashCommandBuilder().setName('join').setDescription('ボイスチャンネルにBotを参加させます'),
     new SlashCommandBuilder().setName('leave').setDescription('再生を終了し退出させます'),
@@ -47,13 +46,12 @@ const commands = [
 client.on('ready', async () => {
     console.log(`Logged in as ${client.user.tag}`);
 
-    // Renderの環境変数からクッキーを読み込む（設定済みならここが動きます）
     if (process.env.YOUTUBE_COOKIE) {
         try {
             await play.setToken({ youtube: { cookie: JSON.parse(process.env.YOUTUBE_COOKIE) } });
-            console.log('環境変数から初期クッキーを正常にロードしました');
+            console.log('環境変数からのクッキーロード成功');
         } catch (e) {
-            console.log('クッキーのロードに失敗しました');
+            console.log('クッキーのロードスキップ');
         }
     }
 
@@ -66,10 +64,8 @@ client.on('ready', async () => {
     }
 });
 
-// --- インタラクション処理 ---
 client.on('interactionCreate', async interaction => {
     
-    // モーダル(フォーム)送信時の処理
     if (interaction.isModalSubmit()) {
         if (interaction.customId === 'cookieModal') {
             const jsonStr = interaction.fields.getTextInputValue('cookieInput');
@@ -102,12 +98,7 @@ client.on('interactionCreate', async interaction => {
 
         if (commandName === 'join') {
             if (!voiceChannel) return interaction.reply({ content: '先にVCに参加してください！', ephemeral: true });
-            joinVoiceChannel({ 
-                channelId: voiceChannel.id, 
-                guildId: guildId, 
-                adapterCreator: guild.voiceAdapterCreator,
-                selfDeaf: true // ★無音通信バグ対策
-            });
+            joinVoiceChannel({ channelId: voiceChannel.id, guildId: guildId, adapterCreator: guild.voiceAdapterCreator, selfDeaf: true });
             return interaction.reply('🔊 ボイスチャンネルに参加しました！');
         }
 
@@ -124,31 +115,50 @@ client.on('interactionCreate', async interaction => {
             await interaction.deferReply();
 
             const query = options.getString('query');
+            
+            // 1. まず普通に検索（YouTubeなどから曲名を取得）
             const ytInfo = await play.search(query, { limit: 1 });
             if (!ytInfo.length) return interaction.editReply('動画が見つかりませんでした。');
 
-            const song = { title: ytInfo[0].title, url: ytInfo[0].url, duration: ytInfo[0].durationRaw };
+            const originalTitle = ytInfo[0].title;
+            let finalUrl = ytInfo[0].url;
+
+            // ==========================================
+            // ★ YouTubeブロック無効化ロジック (SoundCloudう回)
+            // ==========================================
+            try {
+                if (finalUrl.includes('youtube.com') || finalUrl.includes('youtu.be')) {
+                    // SoundCloudのシステム通行証を取得
+                    const scClientId = await play.getFreeClientID();
+                    await play.setToken({ soundcloud: { client_id: scClientId } });
+                    
+                    // 取得したYouTubeの正規タイトルを使って、SoundCloud上から全く同じ音源を探す
+                    const scInfo = await play.search(originalTitle, { source: { soundcloud: 'tracks' }, limit: 1 });
+                    if (scInfo && scInfo.length > 0) {
+                        finalUrl = scInfo[0].url; // 再生用のURLだけを制限のないSoundCloudにすり替える！
+                    }
+                }
+            } catch (err) {
+                console.error('SoundCloudへのう回に失敗（元のURLで試行します）:', err);
+            }
+
+            // ユーザーに表示する画面上ではYouTubeのタイトルのままになる
+            const song = { title: originalTitle, url: finalUrl, duration: ytInfo[0].durationRaw };
 
             if (!serverQueue) {
                 const queueConstruct = {
                     textChannel: interaction.channel,
                     voiceChannel,
-                    connection: joinVoiceChannel({ 
-                        channelId: voiceChannel.id, 
-                        guildId, 
-                        adapterCreator: guild.voiceAdapterCreator,
-                        selfDeaf: true // ★無音通信バグ対策
-                    }),
+                    connection: joinVoiceChannel({ channelId: voiceChannel.id, guildId, adapterCreator: guild.voiceAdapterCreator, selfDeaf: true }),
                     songs: [song],
                     player: createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } }),
                 };
                 queues.set(guildId, queueConstruct);
                 queueConstruct.connection.subscribe(queueConstruct.player);
 
-                // ★万が一、裏でプレイヤーが落ちた場合にチャットに警告を出すよう修正
                 queueConstruct.player.on('error', error => {
                     console.error('AudioPlayerError:', error);
-                    queueConstruct.textChannel.send(`⚠️ 内部の音声プレイヤーでエラーが起きました: ${error.message}`);
+                    queueConstruct.textChannel.send(`⚠️ プレイヤー内部でエラー: ${error.message}`);
                     queueConstruct.songs.shift();
                     playSong(guild, queueConstruct.songs[0]);
                 });
@@ -192,7 +202,7 @@ client.on('interactionCreate', async interaction => {
 
     } catch (e) {
         console.error(e);
-        if (interaction.deferred) interaction.editReply('❌ エラーが発生しました。').catch(()=>false);
+        if (interaction.deferred) interaction.editReply('❌ 内部エラーが発生しました。').catch(()=>false);
     }
 });
 
@@ -206,7 +216,7 @@ async function playSong(guild, song) {
         serverQueue.player.play(resource);
     } catch (error) {
         console.error(error);
-        if (serverQueue.textChannel) serverQueue.textChannel.send(`⚠️ 読み込み失敗: サーバー通信エラー。次の曲へスキップします...`);
+        if (serverQueue.textChannel) serverQueue.textChannel.send(`⚠️ 読み込み失敗: セキュリティによりダウンロードが遮断されました。次の曲へスキップします...`);
         serverQueue.songs.shift();
         playSong(guild, serverQueue.songs[0]);
     }
